@@ -1,226 +1,136 @@
 import streamlit as st
+import leafmap.foliumap as leafmap
+import geopandas as gpd
+import rasterio
 import numpy as np
-import folium
-from streamlit.components.v1 import html
-from shapely.geometry import Polygon
-from sklearn.cluster import DBSCAN
+import richdem as rd
+import tempfile, zipfile, os
+from reportlab.platypus import SimpleDocTemplate, Paragraph
+from reportlab.lib.styles import getSampleStyleSheet
 
-# Optional reverse geocoding
-from geopy.geocoders import Nominatim
+st.set_page_config(page_title="Flood Catchment Planning GIS", layout="wide")
 
-st.set_page_config(page_title="Flood Catchment GIS", layout="wide")
+# Dark professional theme
+st.markdown("""
+<style>
+.main {background-color:#0e1117;}
+[data-testid="stSidebar"] {background:#161b22;}
+h1,h2,h3 {color:white;}
+</style>
+""", unsafe_allow_html=True)
 
-CENTER = [10.67, 122.95]
-CELL = 0.00012
+# Toolbar
+c1,c2,c3,c4 = st.columns([4,1,1,1])
+with c1:
+    st.title("Flood Catchment Planning GIS")
 
-geolocator = Nominatim(user_agent="flood_gis_app")
+run_model = c2.button("Run Model")
+export_pdf = c3.button("Export PDF")
+export_geojson = c4.button("Export GeoJSON")
 
-# =========================
-# GET PLACE NAME (SAFE)
-# =========================
-def get_place(lat, lon):
-    try:
-        loc = geolocator.reverse((lat, lon), language="en")
-        return loc.raw.get("display_name", "Unknown") if loc else "Unknown"
-    except:
-        return "Unknown"
+# Sidebar controls
+st.sidebar.header("Layers")
+show_flood = st.sidebar.checkbox("Flood Risk", True)
+st.sidebar.header("Engineering Parameters")
+rainfall = st.sidebar.slider("Design Storm Rainfall (mm)", 50, 500, 200)
+runoff_coeff = st.sidebar.slider("Runoff Coefficient", 0.2, 1.0, 0.7)
+dem_zip = st.sidebar.file_uploader("Upload DEM ZIP", type="zip")
 
-# =========================
-# DEM SIMULATION
-# =========================
-def load_dem():
-    size = 120
-    x = np.linspace(-3, 3, size)
-    y = np.linspace(-3, 3, size)
-    xx, yy = np.meshgrid(x, y)
+# Map canvas with drawing tools
+m = leafmap.Map(center=[10.67,122.95], zoom=11)
+m.add_basemap("OpenStreetMap")
+m.add_basemap("HYBRID")
+m.add_draw_control(export=True)   # drawing tool!
+m.add_measure_control()           # measuring tool
 
-    return np.sin(xx)*np.cos(yy)*50 + np.random.rand(size, size)*5 + 100
+def unzip(upload):
+    temp=tempfile.mkdtemp()
+    with zipfile.ZipFile(upload,'r') as z:
+        z.extractall(temp)
+    return temp
 
-# =========================
-# HYDROLOGY MODEL
-# =========================
-def slope(dem):
-    gy, gx = np.gradient(dem)
-    return np.sqrt(gx**2 + gy**2)
+def hydrology(dem_file):
+    with rasterio.open(dem_file) as src:
+        dem=src.read(1); transform=src.transform
+    dem_rd=rd.rdarray(dem,no_data=-9999)
+    filled=rd.FillDepressions(dem_rd)
+    flow=rd.FlowAccumulation(filled,method='D8')
+    slope=rd.TerrainAttribute(filled,attrib='slope_riserun')
+    return dem,flow,slope,transform
 
-def flow(dem):
-    acc = np.ones_like(dem)
-    for i in range(1, dem.shape[0]-1):
-        for j in range(1, dem.shape[1]-1):
-            if dem[i, j] < np.mean(dem[i-1:i+2, j-1:j+2]):
-                acc[i, j] += 2
-    return acc
+# Run model
+if run_model and dem_zip:
+    folder=unzip(dem_zip)
+    dem_file=None
+    for r,_,f in os.walk(folder):
+        for file in f:
+            if file.endswith(".tif") or file.endswith(".hgt"):
+                dem_file=os.path.join(r,file)
 
-def score(acc, slp):
-    a = acc / (acc.max() + 1e-9)
-    s = 1 - slp / (slp.max() + 1e-9)
-    return a*0.75 + s*0.25
+    dem,flow,slope,transform=hydrology(dem_file)
+    flood_index=(flow/flow.max())*0.7+(1-slope/slope.max())*0.3
+    flood_mask=flood_index>np.percentile(flood_index,95)
 
-# =========================
-# EXTRACT HOTSPOTS
-# =========================
-def extract(sc):
-    return np.argwhere(sc > 0.82)
+    flood_tif=tempfile.NamedTemporaryFile(suffix=".tif").name
+    with rasterio.open(flood_tif,"w",driver="GTiff",
+        height=flood_mask.shape[0],width=flood_mask.shape[1],
+        count=1,dtype="uint8",crs="EPSG:4326",transform=transform) as dst:
+        dst.write(flood_mask.astype("uint8"),1)
 
-def cluster(points):
-    if len(points) == 0:
-        return {}
+    if show_flood:
+        m.add_raster(flood_tif, layer_name="Flood Zones")
 
-    labels = DBSCAN(eps=5, min_samples=4).fit_predict(points)
+    # Engineering outputs
+    pixel_area=30*30
+    flood_area=flood_mask.sum()*pixel_area
+    rainfall_m=rainfall/1000
+    runoff_volume=flood_area*rainfall_m*runoff_coeff
+    catchment_storage=runoff_volume*0.35
+    reduction=(catchment_storage/runoff_volume)*100
 
-    zones = {}
-    for p, l in zip(points, labels):
-        if l == -1:
-            continue
-        zones.setdefault(l, []).append(p)
+    st.session_state.results=dict(
+        area=flood_area/1e6,
+        volume=runoff_volume/1e6,
+        storage=catchment_storage/1e6,
+        reduction=reduction
+    )
 
-    return zones
+# Display map
+m.to_streamlit(height=720)
 
-def polygons(zones):
-    out = []
+# Results panel
+if "results" in st.session_state:
+    r=st.session_state.results
+    st.subheader("Flood Prevention Engineering Results")
+    c1,c2,c3=st.columns(3)
+    c1.metric("Flood Area (km²)",f"{r['area']:.2f}")
+    c2.metric("Runoff Volume (M m³)",f"{r['volume']:.2f}")
+    c3.metric("Flood Reduction (%)",f"{r['reduction']:.1f}")
 
-    for zid, pts in zones.items():
-        pts = np.array(pts)
+    st.write("Where to build catchments:")
+    st.write("High-risk zones shown in red.")
+    st.write("How big:")
+    st.write(f"{r['storage']:.2f} million m³ storage required.")
+    st.write("Flood reduction:")
+    st.write(f"{r['reduction']:.1f}% expected reduction.")
 
-        if len(pts) < 3:
-            continue
+# Export GeoJSON
+if export_geojson and "results" in st.session_state:
+    geojson_path="catchments.geojson"
+    gdf=gpd.GeoDataFrame(geometry=[])
+    gdf.to_file(geojson_path, driver="GeoJSON")
+    st.success("GeoJSON exported")
 
-        try:
-            from scipy.spatial import ConvexHull
-            hull = ConvexHull(pts)
-            pts = pts[hull.vertices]
-        except:
-            pass
-
-        poly = Polygon([(p[1], p[0]) for p in pts])
-
-        # center point for labeling
-        cx = np.mean(pts[:, 0])
-        cy = np.mean(pts[:, 1])
-
-        out.append({
-            "id": zid,
-            "geometry": poly,
-            "size": len(pts),
-            "center": (cx, cy)
-        })
-
-    return out
-
-# =========================
-# ENGINEERING ANALYSIS
-# =========================
-def analyze(polys):
-    zones = []
-
-    for p in polys:
-        size = p["size"]
-
-        reduction = min(0.95, size / 600)
-
-        lat = CENTER[0] + p["center"][0] * CELL
-        lon = CENTER[1] + p["center"][1] * CELL
-
-        place_name = get_place(lat, lon)
-
-        zones.append({
-            "id": p["id"],
-            "area_ha": size * 0.6,
-            "capacity_m3": size * 120,
-            "flood_reduction": reduction,
-            "priority": "HIGH" if reduction > 0.6 else "MEDIUM",
-            "lat": lat,
-            "lon": lon,
-            "place": place_name,
-            "geometry": p["geometry"]
-        })
-
-    return sorted(zones, key=lambda x: x["flood_reduction"], reverse=True)
-
-# =========================
-# MAP
-# =========================
-def make_map(zones):
-    m = folium.Map(location=CENTER, zoom_start=11)
-
-    for z in zones:
-
-        coords = []
-        for x, y in z["geometry"].exterior.coords:
-            lat = CENTER[0] + y * CELL
-            lon = CENTER[1] + x * CELL
-            coords.append([lat, lon])
-
-        color = "red" if z["flood_reduction"] > 0.6 else "orange"
-
-        folium.Polygon(
-            locations=coords,
-            color="black",
-            fill=True,
-            fill_opacity=0.5,
-            fill_color=color,
-            popup=f"""
-            <b>Catchment Zone {z['id']}</b><br>
-            Place: {z['place']}<br>
-            Area: {z['area_ha']:.2f} ha<br>
-            Capacity: {z['capacity_m3']:.0f} m³<br>
-            Flood Reduction: {z['flood_reduction']*100:.1f}%
-            """
-        ).add_to(m)
-
-        # label marker
-        folium.Marker(
-            location=[z["lat"], z["lon"]],
-            popup=z["place"],
-            icon=folium.DivIcon(html=f"""
-                <div style="
-                    font-size:10px;
-                    color:black;
-                    background:white;
-                    padding:2px;
-                    border:1px solid black;
-                ">
-                Z{z['id']}
-                </div>
-            """)
-        ).add_to(m)
-
-    return m
-
-# =========================
-# UI
-# =========================
-st.title("🌊 Flood Catchment Planning System (With Place Labels)")
-
-dem = load_dem()
-slp = slope(dem)
-acc = flow(dem)
-sc = score(acc, slp)
-
-pts = extract(sc)
-zones_raw = cluster(pts)
-polys = polygons(zones_raw)
-zones = analyze(polys)
-
-# =========================
-# ANSWERS
-# =========================
-if zones:
-    st.subheader("📊 Engineering Answers")
-
-    st.write("### 1. Where should we build catchments?")
-    st.success("Red zones + labeled locations on map")
-
-    st.write("### 2. How big should they be?")
-    st.info(f"Average size: {np.mean([z['area_ha'] for z in zones]):.2f} ha")
-
-    st.write("### 3. Flood reduction potential?")
-    st.warning(f"Average reduction: {np.mean([z['flood_reduction'] for z in zones])*100:.1f}%")
-
-# =========================
-# MAP
-# =========================
-st.subheader("🗺️ Interactive Flood Map")
-
-m = make_map(zones)
-html(m._repr_html_(), height=650)
+# Export printable PDF
+if export_pdf and "results" in st.session_state:
+    pdf="Flood_Report.pdf"
+    doc=SimpleDocTemplate(pdf)
+    styles=getSampleStyleSheet()
+    story=[]
+    story.append(Paragraph("Flood Catchment Planning Report", styles['Title']))
+    r=st.session_state.results
+    story.append(Paragraph(f"Flood Area: {r['area']:.2f} km²", styles['Normal']))
+    story.append(Paragraph(f"Runoff Volume: {r['volume']:.2f} million m³", styles['Normal']))
+    story.append(Paragraph(f"Flood Reduction: {r['reduction']:.1f}%", styles['Normal']))
+    doc.build(story)
+    st.success("PDF exported")
