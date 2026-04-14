@@ -1,21 +1,32 @@
 import streamlit as st
 import numpy as np
-import json
-from shapely.geometry import Polygon
-from sklearn.cluster import DBSCAN
 import folium
 from streamlit.components.v1 import html
+from shapely.geometry import Polygon
+from sklearn.cluster import DBSCAN
 
-# =========================
-# CONFIG
-# =========================
+# Optional reverse geocoding
+from geopy.geocoders import Nominatim
+
+st.set_page_config(page_title="Flood Catchment GIS", layout="wide")
+
 CENTER = [10.67, 122.95]
 CELL = 0.00012
 
-st.set_page_config(page_title="Flood Catchment Planner", layout="wide")
+geolocator = Nominatim(user_agent="flood_gis_app")
 
 # =========================
-# DEM SIMULATION (replace later with real DEM)
+# GET PLACE NAME (SAFE)
+# =========================
+def get_place(lat, lon):
+    try:
+        loc = geolocator.reverse((lat, lon), language="en")
+        return loc.raw.get("display_name", "Unknown") if loc else "Unknown"
+    except:
+        return "Unknown"
+
+# =========================
+# DEM SIMULATION
 # =========================
 def load_dem():
     size = 120
@@ -23,14 +34,10 @@ def load_dem():
     y = np.linspace(-3, 3, size)
     xx, yy = np.meshgrid(x, y)
 
-    return (
-        np.sin(xx) * np.cos(yy) * 50 +
-        np.random.rand(size, size) * 5 +
-        100
-    )
+    return np.sin(xx)*np.cos(yy)*50 + np.random.rand(size, size)*5 + 100
 
 # =========================
-# HYDROLOGY PROXY MODEL
+# HYDROLOGY MODEL
 # =========================
 def slope(dem):
     gy, gx = np.gradient(dem)
@@ -47,17 +54,18 @@ def flow(dem):
 def score(acc, slp):
     a = acc / (acc.max() + 1e-9)
     s = 1 - slp / (slp.max() + 1e-9)
-    return a * 0.75 + s * 0.25
+    return a*0.75 + s*0.25
 
 # =========================
-# ZONE CREATION
+# EXTRACT HOTSPOTS
 # =========================
-def extract(score):
-    return np.argwhere(score > 0.82)
+def extract(sc):
+    return np.argwhere(sc > 0.82)
 
 def cluster(points):
     if len(points) == 0:
         return {}
+
     labels = DBSCAN(eps=5, min_samples=4).fit_predict(points)
 
     zones = {}
@@ -65,13 +73,15 @@ def cluster(points):
         if l == -1:
             continue
         zones.setdefault(l, []).append(p)
+
     return zones
 
-def build_polygons(zones):
+def polygons(zones):
     out = []
 
     for zid, pts in zones.items():
         pts = np.array(pts)
+
         if len(pts) < 3:
             continue
 
@@ -84,23 +94,34 @@ def build_polygons(zones):
 
         poly = Polygon([(p[1], p[0]) for p in pts])
 
+        # center point for labeling
+        cx = np.mean(pts[:, 0])
+        cy = np.mean(pts[:, 1])
+
         out.append({
             "id": zid,
             "geometry": poly,
-            "size": len(pts)
+            "size": len(pts),
+            "center": (cx, cy)
         })
 
     return out
 
 # =========================
-# ENGINEERING LOGIC
+# ENGINEERING ANALYSIS
 # =========================
 def analyze(polys):
     zones = []
 
     for p in polys:
         size = p["size"]
+
         reduction = min(0.95, size / 600)
+
+        lat = CENTER[0] + p["center"][0] * CELL
+        lon = CENTER[1] + p["center"][1] * CELL
+
+        place_name = get_place(lat, lon)
 
         zones.append({
             "id": p["id"],
@@ -108,20 +129,23 @@ def analyze(polys):
             "capacity_m3": size * 120,
             "flood_reduction": reduction,
             "priority": "HIGH" if reduction > 0.6 else "MEDIUM",
+            "lat": lat,
+            "lon": lon,
+            "place": place_name,
             "geometry": p["geometry"]
         })
 
     return sorted(zones, key=lambda x: x["flood_reduction"], reverse=True)
 
 # =========================
-# MAP BUILDER
+# MAP
 # =========================
 def make_map(zones):
     m = folium.Map(location=CENTER, zoom_start=11)
 
     for z in zones:
-        coords = []
 
+        coords = []
         for x, y in z["geometry"].exterior.coords:
             lat = CENTER[0] + y * CELL
             lon = CENTER[1] + x * CELL
@@ -136,19 +160,37 @@ def make_map(zones):
             fill_opacity=0.5,
             fill_color=color,
             popup=f"""
-            Zone {z['id']}<br>
+            <b>Catchment Zone {z['id']}</b><br>
+            Place: {z['place']}<br>
             Area: {z['area_ha']:.2f} ha<br>
             Capacity: {z['capacity_m3']:.0f} m³<br>
-            Reduction: {z['flood_reduction']*100:.1f}%
+            Flood Reduction: {z['flood_reduction']*100:.1f}%
             """
+        ).add_to(m)
+
+        # label marker
+        folium.Marker(
+            location=[z["lat"], z["lon"]],
+            popup=z["place"],
+            icon=folium.DivIcon(html=f"""
+                <div style="
+                    font-size:10px;
+                    color:black;
+                    background:white;
+                    padding:2px;
+                    border:1px solid black;
+                ">
+                Z{z['id']}
+                </div>
+            """)
         ).add_to(m)
 
     return m
 
 # =========================
-# STREAMLIT UI
+# UI
 # =========================
-st.title("🌊 Flood Catchment Planning System (Bacolod Prototype)")
+st.title("🌊 Flood Catchment Planning System (With Place Labels)")
 
 dem = load_dem()
 slp = slope(dem)
@@ -157,32 +199,28 @@ sc = score(acc, slp)
 
 pts = extract(sc)
 zones_raw = cluster(pts)
-polys = build_polygons(zones_raw)
+polys = polygons(zones_raw)
 zones = analyze(polys)
 
 # =========================
 # ANSWERS
 # =========================
 if zones:
-    top = zones[0]
+    st.subheader("📊 Engineering Answers")
 
-    st.subheader("📊 Engineering Output")
+    st.write("### 1. Where should we build catchments?")
+    st.success("Red zones + labeled locations on map")
 
-    st.write("### 1. Where to build catchments?")
-    st.success("High priority red zones in map")
-
-    st.write("### 2. How big?")
-    st.info(f"Average area: {np.mean([z['area_ha'] for z in zones]):.2f} ha")
+    st.write("### 2. How big should they be?")
+    st.info(f"Average size: {np.mean([z['area_ha'] for z in zones]):.2f} ha")
 
     st.write("### 3. Flood reduction potential?")
-    st.warning(f"Avg reduction: {np.mean([z['flood_reduction'] for z in zones])*100:.1f}%")
+    st.warning(f"Average reduction: {np.mean([z['flood_reduction'] for z in zones])*100:.1f}%")
 
 # =========================
 # MAP
 # =========================
-st.subheader("🗺️ Catchment Zones Map")
+st.subheader("🗺️ Interactive Flood Map")
 
 m = make_map(zones)
-map_html = m._repr_html_()
-
-html(map_html, height=600)
+html(m._repr_html_(), height=650)
